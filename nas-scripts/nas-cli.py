@@ -20,6 +20,7 @@ import tarfile
 import tempfile
 import shutil
 import subprocess
+import time
 import getpass
 import argparse
 import paramiko
@@ -31,10 +32,36 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-NAS_HOST = "192.168.10.232"
+# 2026-09-29 重要（Synology ACL 403 修复）：
+# NAS 为 DSM ext4 + Windows ACL 共享文件夹，POSIX 显示 rwxrwxrwx 但内核 ACL 层
+# 拒绝容器内 nginx worker（uid 101）遍历 bind-mounted 的 dist（stat/open 均 EACCES），
+# chown/chmod/setfacl 均无效。已改为在远端 config/nginx.conf 首行加 `user root;`
+# （config/ 不被本部署流程覆盖，故持久生效）。若前端再次出现 403，先检查该行是否还在。
+# NAS 地址来源（DHCP 下 NAS 重启可能换 IP，2026-10-09 实测从 .2 漂到 .13）：
+#   1. 同目录 nas-host.conf（纯文本，一行 IP）——`nas-cli.py detect` 自动探测写入
+#   2. 缺省回退 DEFAULT_NAS_HOST
+# DSM 侧做 DHCP 固定分配后可把 nas-host.conf 内容写死，不再依赖探测。
+DEFAULT_NAS_HOST = "192.168.5.13"
 NAS_PORT = 2222
 NAS_USER = "coolwing"
 REMOTE_DIR = "/volume1/docker/sers-makerhub"
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load_nas_host():
+    conf = os.path.join(_SCRIPT_DIR, "nas-host.conf")
+    try:
+        with open(conf, "r", encoding="utf-8") as f:
+            ip = f.read().strip()
+            if ip:
+                return ip
+    except OSError:
+        pass
+    return DEFAULT_NAS_HOST
+
+
+NAS_HOST = _load_nas_host()
 
 PROJECT_ROOT = r"C:\Users\Dikun\Desktop\control\2025-12-13Deepseek\2025-12-24Deepseek"
 BACKEND_DIR = os.path.join(PROJECT_ROOT, "sers-makerhub-backend")
@@ -50,18 +77,37 @@ EXCLUDE_NAMES_ANYWHERE = {
     ".pio",
     ".idea",
     ".vscode",
+    # 2026-09-30 重要：用户上传的原始数据**绝不能**参与部署。
+    # tar 不认 .gitignore，之前 backend/uploads/ 会被整体打包上传；
+    # 配合下方的 `rm -rf backend`，任何在本地快照之后由用户新上传的文件
+    # 都会在下次部署时被静默删除（本地看不到，因为 uploads/ 被 gitignore）。
+    "uploads",
 }
 EXCLUDE_SUFFIXES = (".log", ".tar.gz", ".tmp")
 
 
 def get_password():
+    """密码来源优先级：环境变量 → （无专用密钥时才）交互提示 → 空（走密钥）
+
+    2026-10：本机 ~/.ssh/sers_nas 公钥已授权到 NAS。原实现在非交互终端直接 exit(1)，
+    自动化无法部署；而"先看 isatty 再提示"在 stdin 被当成 tty 的调用环境里会挂住等输入。
+    现在改为：**只要有专用密钥就直接走密钥认证，绝不提示**。
+    """
     pw = os.environ.get("NAS_PASSWORD", "")
     if pw:
         return pw
+    if _key_path():
+        return ""            # 有 sers_nas 密钥 → 密钥认证
     if sys.stdin.isatty():
         return getpass.getpass(f"请输入 NAS ({NAS_USER}) 密码: ")
-    print("错误：未设置 NAS_PASSWORD 环境变量，且当前非交互式终端。")
+    print("错误：既没有专用密钥，也没有 NAS_PASSWORD，且当前非交互式终端。")
     sys.exit(1)
+
+
+def _key_path():
+    """专用密钥（文件名非默认，paramiko 不会自动找）"""
+    p = os.path.expanduser("~/.ssh/sers_nas")
+    return p if os.path.isfile(p) else None
 
 
 def should_exclude(name):
@@ -136,25 +182,62 @@ def make_deploy_tar():
 def connect_ssh(password):
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(
+    kwargs = dict(
         hostname=NAS_HOST,
         port=NAS_PORT,
         username=NAS_USER,
-        password=password,
-        look_for_keys=False,
         allow_agent=False,
         timeout=30,
+        # 2026-10：支持密钥登录（原 look_for_keys=False 只能密码登录，自动化无法使用）
+        look_for_keys=True,
     )
+    kp = _key_path()
+    if kp:
+        kwargs["key_filename"] = kp
+    if password:
+        kwargs["password"] = password
+    try:
+        ssh.connect(**kwargs)
+    except paramiko.AuthenticationException:
+        print("认证失败：SSH 密钥未授权，且没有可用密码。")
+        print(f"  方案 A：把 {os.path.expanduser('~/.ssh/sers_nas.pub')} 内容追加到 NAS 的 ~/.ssh/authorized_keys")
+        print("  方案 B：设置 NAS_PASSWORD 环境变量后再执行")
+        sys.exit(1)
     return ssh
 
 
-def run_command(ssh, command, print_output=True):
+def run_command(ssh, command, print_output=True, timeout_s=900):
+    """执行远端命令并实时回显。
+
+    2026-10 修复两处会让自动化卡死的问题：
+      1) 原先 `get_pty=True`：PTY 下命令（如 `docker compose ps`）结束后通道不一定立刻
+         发 EOF，`readline()` 会一直阻塞（实测 status 卡死 >4 分钟无任何输出）。
+         改为不带 PTY —— docker compose 的输出仍是逐行流式的，只是没有彩色/动画。
+      2) 原先没有超时：一条卡住的命令会让脚本永久挂住。现在到点主动断开并返回非零。
+    """
     print(f"\n执行: {command}")
-    stdin, stdout, stderr = ssh.exec_command(command, get_pty=True)
-    if print_output:
-        for line in iter(stdout.readline, ""):
-            print(line, end="")
-    return stdout.channel.recv_exit_status()
+    stdin, stdout, stderr = ssh.exec_command(command, get_pty=False, timeout=timeout_s)
+    channel = stdout.channel
+    channel.settimeout(1.0)
+    deadline = time.time() + timeout_s
+    buf = ""
+    while True:
+        if channel.recv_ready():
+            buf += channel.recv(65536).decode("utf-8", "replace")
+            *lines, buf = buf.split("\n")
+            if print_output:
+                for line in lines:
+                    print(line)
+        if channel.exit_status_ready() and not channel.recv_ready():
+            break
+        if time.time() > deadline:
+            print(f"\n⚠️ 命令超过 {timeout_s}s 未结束，已放弃等待")
+            channel.close()
+            return 124
+        time.sleep(0.05)
+    if buf and print_output:
+        print(buf)
+    return channel.recv_exit_status()
 
 
 def cmd_deploy(password, skip_build=False):
@@ -178,12 +261,23 @@ def cmd_deploy(password, skip_build=False):
                 print(f"\n上传到 NAS: {REMOTE_DIR}/deploy.tar.gz")
                 scp.put(tar_path, remote_path=f"{REMOTE_DIR}/deploy.tar.gz")
 
+            # 注意：这里**不能**用 `rm -rf backend`。
+            # 那会把 NAS 上的 backend/uploads/（用户上传的光谱等原始数据）一并删除，
+            # 且因为本地 uploads/ 被 gitignore，覆盖是静默的。
+            # 改为「清空 backend 但保留 uploads」：
             deploy_cmd = (
                 f"cd {REMOTE_DIR} && "
                 "docker compose down && "
-                "rm -rf backend frontend/dist && "
+                "find backend -mindepth 1 -maxdepth 1 ! -name uploads -exec rm -rf {} + && "
+                "rm -rf frontend/dist && "
                 "tar -xzf deploy.tar.gz && "
                 "rm -f deploy.tar.gz && "
+                # 把 NAS 局域网 IP 注入后端环境：云桥下载地址分级裁决需要 NC_LAN_IP
+                # 作为 NAS 侧内网地址，否则 Docker 容器读到的 MQTT_BROKER_URL 往往是
+                # 容器内主机名，设备从公网入口打开时拿不到可访问的下载地址。
+                f"for f in backend/.env.dxp4800 backend/.env.docker backend/.env.local backend/.env; do "
+                f"  [ -f \"$f\" ] && sed -i '/^NC_LAN_IP=/d' \"$f\" && echo 'NC_LAN_IP={NAS_HOST}' >> \"$f\"; "
+                "done && "
                 # NAS 本机 6379 通常已被系统 Redis 占用，把容器 Redis 映射到 6380
                 "sed -i 's/6379:6379/6380:6379/' docker-compose.yml && "
                 "docker compose up -d --build --force-recreate"
@@ -202,6 +296,42 @@ def cmd_deploy(password, skip_build=False):
             ssh.close()
     finally:
         os.remove(tar_path)
+
+
+def detect_nas_host():
+    """扫描本机所在 /24 网段，找 2222(SSH)+5000(后端/DSM) 同时开放的 NAS，
+    命中则写入 nas-host.conf 并返回 IP；找不到返回 None。"""
+    import socket as _socket
+    import concurrent.futures as _cf
+
+    base = NAS_HOST.rsplit(".", 1)[0]          # 以当前配置所在网段为扫描范围
+    probe_ports = (2222, 5000)
+
+    def probe(ip):
+        hits = []
+        for port in probe_ports:
+            s = _socket.socket()
+            s.settimeout(0.4)
+            try:
+                s.connect((ip, port))
+                hits.append(port)
+            except OSError:
+                pass
+            finally:
+                s.close()
+        return ip, hits
+
+    print(f"正在扫描 {base}.0/24 寻找 NAS（{probe_ports} 同时开放）…")
+    with _cf.ThreadPoolExecutor(max_workers=128) as ex:
+        for ip, hits in ex.map(probe, [f"{base}.{i}" for i in range(1, 255)]):
+            if len(hits) == len(probe_ports):
+                print(f"发现 NAS: {ip}")
+                conf = os.path.join(_SCRIPT_DIR, "nas-host.conf")
+                with open(conf, "w", encoding="utf-8") as f:
+                    f.write(ip + "\n")
+                print(f"已写入 {conf}（后续命令自动使用）")
+                return ip
+    return None
 
 
 def cmd_simple(password, action):
@@ -230,8 +360,8 @@ def main():
     parser = argparse.ArgumentParser(description="SERS MakerHub NAS 管理工具")
     parser.add_argument(
         "command",
-        choices=["deploy", "start", "stop", "restart", "logs", "status"],
-        help="要执行的操作",
+        choices=["deploy", "start", "stop", "restart", "logs", "status", "detect"],
+        help="要执行的操作（detect = 重新探测 NAS IP 并记忆，NAS 重启换 IP 后用）",
     )
     parser.add_argument(
         "--skip-build",
@@ -239,6 +369,12 @@ def main():
         help="deploy 时跳过前端构建（使用现有 dist）",
     )
     args = parser.parse_args()
+
+    if args.command == "detect":
+        if not detect_nas_host():
+            print("未找到 NAS：请确认 NAS 已开机、与本机在同一网段。")
+            sys.exit(1)
+        return
 
     password = get_password()
 

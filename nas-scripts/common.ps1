@@ -25,6 +25,14 @@ function Invoke-NasCli {
 
     Ensure-Env
 
+    # 2026-10：本机 ~/.ssh/sers_nas 密钥已授权到 NAS ⇒ 免密直接执行（与 nas-cli.py
+    # 的"密钥优先"逻辑一致）。只有密钥缺失时才回退到交互式密码输入。
+    $KeyPath = Join-Path $env:USERPROFILE ".ssh\sers_nas"
+    if (Test-Path $KeyPath) {
+        & $Python $NasCli $Command @ExtraArgs
+        return
+    }
+
     $SecurePassword = Read-Host "请输入 NAS (coolwing) 密码" -AsSecureString
     $PlainPassword = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
         [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($SecurePassword)
